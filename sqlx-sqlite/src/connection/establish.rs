@@ -16,8 +16,10 @@ use std::ffi::{c_void, CStr, CString};
 use std::io;
 use std::os::raw::c_int;
 use std::ptr::{addr_of_mut, null, null_mut};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use crate::options::TempFilename;
 
 // This was originally `AtomicU64` but that's not supported on MIPS (or PowerPC):
 // https://github.com/launchbadge/sqlx/issues/2859
@@ -52,6 +54,13 @@ pub struct EstablishParams {
     pub(crate) command_channel_size: usize,
     #[cfg(feature = "regexp")]
     register_regexp_function: bool,
+
+    temp: Option<Arc<TempFilename>>,
+}
+
+enum FilenameParam {
+    Owned(CString),
+    Temp(Arc),
 }
 
 impl EstablishParams {

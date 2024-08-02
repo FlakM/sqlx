@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod auto_vacuum;
 mod connect;
@@ -6,6 +6,7 @@ mod journal_mode;
 mod locking_mode;
 mod parse;
 mod synchronous;
+mod temp;
 
 use crate::connection::LogSettings;
 pub use auto_vacuum::SqliteAutoVacuum;
@@ -13,12 +14,21 @@ pub use journal_mode::SqliteJournalMode;
 pub use locking_mode::SqliteLockingMode;
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, io, time::Duration};
+use std::fmt::{Debug, Formatter};
+use once_cell::sync::OnceCell;
+use tempfile::{TempDir};
 pub use synchronous::SqliteSynchronous;
 
 use crate::common::DebugFn;
 use crate::connection::collation::Collation;
-use sqlx_core::IndexMap;
+use sqlx_core::{Either, IndexMap};
+
+#[cfg(doc)]
+use {
+    sqlx_core::pool::{Pool, PoolOptions},
+    crate::SqlitePool,
+};
 
 /// Options and flags which can be used to configure a SQLite connection.
 ///
@@ -54,7 +64,7 @@ use sqlx_core::IndexMap;
 /// ```
 #[derive(Clone, Debug)]
 pub struct SqliteConnectOptions {
-    pub(crate) filename: Cow<'static, Path>,
+    pub(crate) filename: Filename,
     pub(crate) in_memory: bool,
     pub(crate) read_only: bool,
     pub(crate) create_if_missing: bool,
@@ -86,6 +96,24 @@ pub struct SqliteConnectOptions {
     pub(crate) register_regexp_function: bool,
 }
 
+#[derive(Clone)]
+pub(crate) enum Filename {
+    Owned(PathBuf),
+    /// A little convoluted but both `Arc`s are needed here:
+    ///
+    /// The outer `Arc` shares ownership of the `OnceCell` so it can be initialized once for
+    /// all handles (`Clone` of an uninitialized `OnceCell` just creates a new `OnceCell`).
+    ///
+    /// The inner `Arc` shares ownership of the `TempDir` so that it's only dropped
+    /// (thus deleting the directory and all its contents) when all handles are dropped.
+    Temp(Arc<OnceCell<Arc<TempFilename>>>),
+}
+
+pub(crate) struct TempFilename {
+    tempdir: TempDir,
+    path: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub enum OptimizeOnClose {
     Enabled { analysis_limit: Option<u32> },
@@ -99,10 +127,7 @@ impl Default for SqliteConnectOptions {
 }
 
 impl SqliteConnectOptions {
-    /// Construct `Self` with default options.
-    ///
-    /// See the source of this method for the current defaults.
-    pub fn new() -> Self {
+    fn with_filename(filename: Filename) -> Self {
         let mut pragmas: IndexMap<Cow<'static, str>, Option<Cow<'static, str>>> = IndexMap::new();
 
         // Standard pragmas
@@ -186,7 +211,7 @@ impl SqliteConnectOptions {
         pragmas.insert("analysis_limit".into(), None);
 
         Self {
-            filename: Cow::Borrowed(Path::new(":memory:")),
+            filename,
             in_memory: false,
             read_only: false,
             create_if_missing: false,
@@ -209,19 +234,120 @@ impl SqliteConnectOptions {
         }
     }
 
+    /// Start building a SQLite connection using a path to a database file, with default settings.
+    ///
+    /// See the source file for current defaults.
+    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        // `with_filename()` is the common constructor
+        Self::with_filename(Filename::Owned(path.into()))
+    }
+
+    /// Start building a SQLite connection to an in-memory database, with default settings.
+    ///
+    /// Instead of `:memory:`, this will generate a unique path inside [`std::env::temp_dir()`]
+    /// if [shared-cache mode] mode is enabled.
+    ///
+    /// ## Note: Usage with `Pool`
+    /// An in-memory database with default settings should **not** be used with
+    /// [`Pool`] ([`SqlitePool`]), as multiple connections **will not share data**,
+    /// even with the same `SqliteConnectOptions` instance.
+    ///
+    /// You can work around this by enabling [shared-cache mode], but as the
+    /// [`SQLITE_OPEN_SHAREDCACHE` option is soft-deprecated by SQLite][shared-cache-discouraged]
+    /// ("is discouraged"), you should probably use a database backed by a tempfile
+    /// instead ([`Self::temp()`]).
+    ///
+    /// If you *do* insist on use this with `Pool`, we recommend the following settings:
+    ///
+    /// * Set [`.shared_cache(true)`][shared-cache mode] on this `ConnectOptions`.
+    ///     * Or set [`PoolOptions::max_connections()`] to 1, making the pool effectively a `Mutex`;
+    ///     * Or just wrap a single connection explicitly in an async `Mutex`
+    ///       (both Tokio and `async-std` have mutexes).
+    /// * Set [`PoolOptions::max_lifetime()`] and [`PoolOptions::idle_timeout()`] to `None`.
+    ///     * This will prevent the pool from reaping connections.
+    ///     * Note that unrecoverable errors will still cause connections to be closed.
+    /// * Set [`PoolOptions::min_connections()`] to a non-zero value.
+    ///     * This will reduce (but not eliminate) the chance of data loss.
+    ///
+    /// Even with these settings,
+    /// **the contents of the database are not guaranteed to be retained**.
+    /// Your application should be designed to handle and recover from data loss
+    /// when using this mode.
+    ///
+    /// [shared-cache mode]: Self::shared_cache
+    /// [shared-cache-discouraged]: https://www.sqlite.org/sharedcache.html#dontuse
+    pub fn memory() -> Self {
+        Self::temp().in_memory(true)
+    }
+
+    /// Start building a SQLite connection that will use a unique path in [`std::env::temp_dir()`].
+    ///
+    /// This will create a directory under [`std::env::temp_dir()`] using [`tempfile::TempDir`].
+    /// The created directory, and all its contents, will be dropped when this `ConnectOptions`
+    /// and all created connections have been closed.
+    ///
+    /// The path of the directory and database file will not be available until a connection
+    /// is attempted, but can be forced .
+    pub fn temp() -> Self {
+        Self::with_filename(Filename::temp())
+    }
+
+    /// Construct `Self` with default options.
+    ///
+    /// See the source file for the current defaults.
+    #[deprecated =
+    "Deprecated in favor of specialized constructors; \
+         use `SqliteConnectOptions::with_path()`, `::memory()`, or `::temp()`"
+    ]
+    pub fn new() -> Self {
+        Self::memory()
+    }
+
     /// Sets the name of the database file.
     ///
     /// This is a low-level API, and SQLx will apply no special treatment for `":memory:"` as an
-    /// in-memory database using this method. Using [`SqliteConnectOptions::from_str()`][SqliteConnectOptions#from_str] may be
+    /// in-memory database using this method.
+    ///
+    /// Using [`SqliteConnectOptions::from_str()`][SqliteConnectOptions#from_str] may be
     /// preferred for simple use cases.
     pub fn filename(mut self, filename: impl AsRef<Path>) -> Self {
-        self.filename = Cow::Owned(filename.as_ref().to_owned());
+        self.filename = Filename::Owned(filename.as_ref().into());
         self
     }
 
     /// Gets the current name of the database file.
+    ///
+    /// ### Note: May Block or Panic
+    /// If this `ConnectOptions` was created with [`Self::temp()`] or [`Self::memory()`]
+    /// and a database connection has yet to be opened, this will attempt to create
+    /// a new, unique directory in [`std::env::tempdir()`] for SQLite to use.
+    ///
+    /// Accordingly, this may block on filesystem access.
+    ///
+    /// Additionally, since this method signature does not allow returning a `Result`,
+    /// it will instead **panic** if a directory that does not already exist could not be created.
+    ///
+    /// See [`.try_filename()`][Self::try_filename] for a fallible version.
     pub fn get_filename(&self) -> &Path {
-        &self.filename
+        self.try_filename()
+            .expect("failed to create temp file")
+    }
+
+    /// Gets the current name of the database file.
+    ///
+    /// ### Note: May Block
+    /// If this `ConnectOptions` was created with [`Self::temp()`] or [`Self::memory()`]
+    /// and a database connection has yet to be opened, this will attempt to create
+    /// a new, unique directory in [`std::env::tempdir()`] for SQLite to use.
+    ///
+    /// Accordingly, this may block on filesystem access.
+    ///
+    /// Returns an error if the directory could not be created.
+    pub fn try_filename(&self) -> io::Result<&Path> {
+        self.filename.try_get()
+            .map(|either| {
+                either.either(|p| p, |temp| &temp.path)
+            })
     }
 
     /// Set the enforcement of [foreign key constraints](https://www.sqlite.org/pragma.html#pragma_foreign_keys).
@@ -243,6 +369,21 @@ impl SqliteConnectOptions {
     /// Set the [`SQLITE_OPEN_SHAREDCACHE` flag](https://sqlite.org/sharedcache.html).
     ///
     /// By default, this is disabled.
+    ///
+    /// ### Note: Soft-Deprecated by SQLite
+    /// [Use of shared-cache mode is soft-deprecated by SQLite][shared-mode-discouraged]
+    /// ("is discouraged").
+    ///
+    /// Instead, SQLite recommends using [Write-Ahead Log (WAL) mode], which can be enabled
+    /// by setting [`.journal_mode(SqliteJournalMode::Wal)`][Self::journal_mode].
+    /// Note, however, that WAL mode is a persistent setting; it requires locking the database file
+    /// to change into or out of.
+    ///
+    /// WAL mode also cannot be used with in-memory databases
+    /// ([`Self::memory()`], [`.in_memory()`][Self::in_memory]).
+    ///
+    /// [shared-cache-discouraged]: https://www.sqlite.org/sharedcache.html#dontuse
+    /// [Write-Ahead Log (WAL) mode]: https://www.sqlite.org/wal.html
     pub fn shared_cache(mut self, on: bool) -> Self {
         self.shared_cache = on;
         self
@@ -568,5 +709,44 @@ impl SqliteConnectOptions {
     pub fn with_regexp(mut self) -> Self {
         self.register_regexp_function = true;
         self
+    }
+}
+
+impl Filename {
+    pub fn temp() -> Self {}
+
+    pub fn path_opt(&self) -> Option<&Path> {
+        match self {
+            Self::Static(s) => Some(s.into()),
+            Self::Owned(p) => Some(p),
+            Self::Temp(temp) =>
+                temp.get().map(|temp| &*temp.path),
+        }
+    }
+
+    pub fn try_get(&self) -> io::Result<Either<&Path, &Arc<TempFilename>>> {
+        match self {
+            Self::Static(s) => Ok(Either::Left(s.into())),
+            Self::Owned(p) => Ok(Either::Left(p)),
+            Self::Temp(temp) => {
+                temp.get_or_try_init(|| {
+                    Ok(Arc::new(TempFilename {
+                        path: tempdir.path().join("db.sqlite3"),
+                        tempdir,
+                    }))
+                })
+                    .map(Either::Right)
+            }
+        }
+    }
+}
+
+impl Debug for Filename {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if let Some(path) = self.path_opt() {
+            Debug::fmt(path, f)
+        } else {
+            Debug::fmt("<path unavailable until a connection is created>", f)
+        }
     }
 }
